@@ -589,4 +589,74 @@ final class MemberMacroTests: XCTestCase {
       indentationWidth: indentationWidth
     )
   }
+
+  func testDetectRecursiveExpansion() {
+    struct NestTypeMacro: MemberMacro {
+      static func expansion(
+        of node: AttributeSyntax,
+        providingMembersOf declaration: some DeclGroupSyntax,
+        conformingTo protocols: [TypeSyntax],
+        in context: some MacroExpansionContext
+      ) throws -> [DeclSyntax] {
+        return ["@nestType struct Nested {}"]
+      }
+    }
+
+    assertMacroExpansion(
+      """
+      @nestType
+      struct S {
+      }
+      """,
+      expandedSource: """
+        struct S {
+
+          struct Nested {
+          }
+        }
+        """,
+      diagnostics: [
+        // The diagnostic is anchored at the '@nestType' attribute of the generated nested type.
+        DiagnosticSpec(message: "recursive expansion of macro 'NestTypeMacro'", line: 3, column: 3)
+      ],
+      macros: ["nestType": NestTypeMacro.self],
+      indentationWidth: indentationWidth
+    )
+  }
+
+  func testSameMacroOnNestedDeclarationsIsNotRecursive() {
+    struct AddBackingStorage: MemberMacro {
+      static func expansion(
+        of node: AttributeSyntax,
+        providingMembersOf declaration: some DeclGroupSyntax,
+        conformingTo protocols: [TypeSyntax],
+        in context: some MacroExpansionContext
+      ) throws -> [DeclSyntax] {
+        return ["var _storage: Storage<Self>"]
+      }
+    }
+
+    assertMacroExpansion(
+      """
+      @addBackingStorage
+      struct Outer {
+        @addBackingStorage
+        struct Inner {
+        }
+      }
+      """,
+      expandedSource: """
+        struct Outer {
+          struct Inner {
+
+            var _storage: Storage<Self>
+          }
+
+          var _storage: Storage<Self>
+        }
+        """,
+      macros: ["addBackingStorage": AddBackingStorage.self],
+      indentationWidth: indentationWidth
+    )
+  }
 }

@@ -658,11 +658,11 @@ private class MacroApplication<Context: MacroExpansionContext>: SyntaxRewriter {
   /// added to top-level 'CodeBlockItemList'.
   var extensions: [CodeBlockItemSyntax] = []
 
-  /// Stores the types of the freestanding macros that are currently expanding.
+  /// Stores the types of the macros that are currently expanding.
   ///
-  /// As macros are expanded by DFS, `expandingFreestandingMacros` always represent the expansion path starting from
+  /// As macros are expanded by DFS, `expandingMacros` always represent the expansion path starting from
   /// the root macro node to the last macro node currently expanding.
-  var expandingFreestandingMacros: [any Macro.Type] = []
+  var expandingMacros: [any Macro.Type] = []
 
   init(
     macroSystem: MacroSystem,
@@ -885,8 +885,12 @@ private class MacroApplication<Context: MacroExpansionContext>: SyntaxRewriter {
 
       // Expand any peer macro on this item.
       if case .decl(let decl) = node.item {
-        for peer in expandCodeBlockPeers(of: decl) {
-          addResult(peer)
+        for peerExpansion in expandCodeBlockPeers(of: decl) {
+          peerExpansion.withExpandedNode { peers in
+            for peer in peers {
+              addResult(peer)
+            }
+          }
         }
         extensions += expandExtensions(of: decl)
       }
@@ -929,8 +933,12 @@ private class MacroApplication<Context: MacroExpansionContext>: SyntaxRewriter {
       }
 
       // Expand any peer macro on this member.
-      for peer in expandMemberDeclPeers(of: node.decl) {
-        addResult(peer)
+      for peerExpansion in expandMemberDeclPeers(of: node.decl) {
+        peerExpansion.withExpandedNode { peers in
+          for peer in peers {
+            addResult(peer)
+          }
+        }
       }
       extensions += expandExtensions(of: node.decl)
     }
@@ -963,8 +971,12 @@ private class MacroApplication<Context: MacroExpansionContext>: SyntaxRewriter {
 
     // Expand any member macros of parent.
     if let parentDeclGroup {
-      for member in expandMembers(of: parentDeclGroup) {
-        addResult(member)
+      for memberExpansion in expandMembers(of: parentDeclGroup) {
+        memberExpansion.withExpandedNode { members in
+          for member in members {
+            addResult(member)
+          }
+        }
       }
     }
 
@@ -1091,18 +1103,23 @@ extension MacroApplication {
     }
   }
 
-  /// Get a list of the macro attribute, the macro definition and the conformance
+  /// Get a list of the macro attribute, the macro definition, the type of the macro and the conformance
   /// protocols list attached to `decl` matching `ofType` macro type.
   ///
   /// The macros must be registered in `macroSystem`.
   private func macroAttributes<MacroType>(
     attachedTo decl: some SyntaxProtocol,
     ofType: MacroType.Type
-  ) -> [(attributeNode: AttributeSyntax, definition: MacroType, conformanceList: InheritedTypeListSyntax)] {
+  ) -> [(
+    attributeNode: AttributeSyntax,
+    definition: MacroType,
+    macro: any Macro.Type,
+    conformanceList: InheritedTypeListSyntax
+  )] {
     return macroAttributes(attachedTo: decl)
       .compactMap { (attributeNode: AttributeSyntax, spec: MacroSpec) in
         if let macroType = spec.type as? MacroType {
-          return (attributeNode, macroType, spec.inheritedTypeList)
+          return (attributeNode, macroType, spec.type, spec.inheritedTypeList)
         } else {
           return nil
         }
@@ -1110,7 +1127,58 @@ extension MacroApplication {
   }
 
   /// Call `expandMacro` for every macro of type `ofType` attached to `decl` and
+  /// return the expanded nodes of each macro, paired with the macro that produced them.
+  ///
+  /// Any macro that is already being expanded is skipped and diagnosed as a recursive expansion. Callers
+  /// that expand further macros on the expanded nodes must do so within `MacroExpansion.withExpandedNode`
+  /// so that such recursion can be detected.
+  ///
+  /// Any error thrown by `expandMacro` and recursive expansion error will be added to diagnostics.
+  private func expandMacroExpansions<
+    ExpandedNode: SyntaxProtocol,
+    ExpandedNodeCollection: Sequence<ExpandedNode>,
+    MacroType
+  >(
+    attachedTo decl: some SyntaxProtocol,
+    ofType: MacroType.Type,
+    expandMacro:
+      (
+        _ attributeNode: AttributeSyntax,
+        _ definition: MacroType,
+        _ conformanceList: InheritedTypeListSyntax
+      ) throws -> ExpandedNodeCollection?
+  ) -> [MacroExpansion<ExpandedNodeCollection>] {
+    var result: [MacroExpansion<ExpandedNodeCollection>] = []
+
+    for macroAttribute in macroAttributes(attachedTo: decl, ofType: ofType) {
+      do {
+        guard !expandingMacros.contains(where: { $0 == macroAttribute.macro }) else {
+          // The macro is already being expanded further up the expansion path, so expanding it again
+          // would generate the same node it was generated from, ad infinitum.
+          throw MacroExpansionError.recursiveExpansion(macroAttribute.macro)
+        }
+
+        if let expanded = try expandMacro(
+          macroAttribute.attributeNode,
+          macroAttribute.definition,
+          macroAttribute.conformanceList
+        ) {
+          result.append(
+            MacroExpansion(expandedNode: expanded, macro: macroAttribute.macro, macroApplication: self)
+          )
+        }
+      } catch {
+        contextGenerator(Syntax(decl)).addDiagnostics(from: error, node: macroAttribute.attributeNode)
+      }
+    }
+    return result
+  }
+
+  /// Call `expandMacro` for every macro of type `ofType` attached to `decl` and
   /// return the list of all expanded nodes.
+  ///
+  /// This is a convenience overload of `expandMacroExpansions` for callers that don't expand any further
+  /// macros on the expanded nodes and therefore don't need to keep track of the macro that produced them.
   private func expandMacros<
     ExpandedNode: SyntaxProtocol,
     ExpandedNodeCollection: Sequence<ExpandedNode>,
@@ -1125,22 +1193,8 @@ extension MacroApplication {
         _ conformanceList: InheritedTypeListSyntax
       ) throws -> ExpandedNodeCollection?
   ) -> [ExpandedNode] {
-    var result: [ExpandedNode] = []
-
-    for macroAttribute in macroAttributes(attachedTo: decl, ofType: ofType) {
-      do {
-        if let expanded = try expandMacro(
-          macroAttribute.attributeNode,
-          macroAttribute.definition,
-          macroAttribute.conformanceList
-        ) {
-          result += expanded
-        }
-      } catch {
-        contextGenerator(Syntax(decl)).addDiagnostics(from: error, node: macroAttribute.attributeNode)
-      }
-    }
-    return result
+    return expandMacroExpansions(attachedTo: decl, ofType: ofType, expandMacro: expandMacro)
+      .flatMap { $0.expandedNode }
   }
 
   /// Expand all the 'peer' macros attached to `decl`.
@@ -1150,8 +1204,8 @@ extension MacroApplication {
   ///   overload is chosen based on the context in which the peers are expanded.
   ///
   /// - Returns: The macro-synthesized peers
-  private func expandMemberDeclPeers(of decl: DeclSyntax) -> [MemberBlockItemSyntax] {
-    return expandMacros(attachedTo: decl, ofType: PeerMacro.Type.self) { attributeNode, definition, conformanceList in
+  private func expandMemberDeclPeers(of decl: DeclSyntax) -> [MacroExpansion<MemberBlockItemListSyntax>] {
+    return expandMacroExpansions(attachedTo: decl, ofType: PeerMacro.Type.self) { attributeNode, definition, _ in
       return try expandPeerMacroMember(
         definition: definition,
         attributeNode: attributeNode,
@@ -1170,8 +1224,8 @@ extension MacroApplication {
   ///   expanded.
   ///
   /// - Returns: The macro-synthesized peers
-  private func expandCodeBlockPeers(of decl: DeclSyntax) -> [CodeBlockItemSyntax] {
-    return expandMacros(attachedTo: decl, ofType: PeerMacro.Type.self) { attributeNode, definition, conformanceList in
+  private func expandCodeBlockPeers(of decl: DeclSyntax) -> [MacroExpansion<CodeBlockItemListSyntax>] {
+    return expandMacroExpansions(attachedTo: decl, ofType: PeerMacro.Type.self) { attributeNode, definition, _ in
       return try expandPeerMacroCodeItem(
         definition: definition,
         attributeNode: attributeNode,
@@ -1202,8 +1256,11 @@ extension MacroApplication {
   }
 
   /// Expand all 'member' macros attached to `decl`.
-  private func expandMembers(of decl: DeclSyntax) -> [MemberBlockItemSyntax] {
-    return expandMacros(attachedTo: decl, ofType: MemberMacro.Type.self) { attributeNode, definition, conformanceList in
+  private func expandMembers(of decl: DeclSyntax) -> [MacroExpansion<MemberBlockItemListSyntax>] {
+    return expandMacroExpansions(attachedTo: decl, ofType: MemberMacro.Type.self) {
+      attributeNode,
+      definition,
+      conformanceList in
       return try expandMemberMacro(
         definition: definition,
         attributeNode: attributeNode,
@@ -1315,13 +1372,13 @@ extension MacroApplication {
   }
 }
 
-// MARK: Freestanding macro expansion
+// MARK: Macro expansion bookkeeping
 
 extension MacroApplication {
   /// Encapsulates an expanded node, the type of the macro from which the node was expanded, and the macro application,
   /// such that recursive macro expansion can be consistently detected.
   struct MacroExpansion<ResultType> {
-    private let expandedNode: ResultType
+    fileprivate let expandedNode: ResultType
     private let macro: any Macro.Type
     private unowned let macroApplication: MacroApplication
 
@@ -1334,17 +1391,21 @@ extension MacroApplication {
     /// Invokes the given closure with the node resulting from a macro expansion.
     ///
     /// This method inserts a pair of push and pop operations immediately around the invocation of `body` to maintain
-    /// an exact stack of expanding freestanding macros to detect recursive macro expansion. Callers should perform any
+    /// an exact stack of expanding macros to detect recursive macro expansion. Callers should perform any
     /// further macro expansion on `expanded` only within the scope of `body`.
     func withExpandedNode<T>(_ body: (_ expandedNode: ResultType) throws -> T) rethrows -> T {
-      macroApplication.expandingFreestandingMacros.append(macro)
+      macroApplication.expandingMacros.append(macro)
       defer {
-        macroApplication.expandingFreestandingMacros.removeLast()
+        macroApplication.expandingMacros.removeLast()
       }
       return try body(expandedNode)
     }
   }
+}
 
+// MARK: Freestanding macro expansion
+
+extension MacroApplication {
   enum MacroExpansionResult<ResultType> {
     /// Expansion of the macro succeeded.
     case success(expansion: MacroExpansion<ResultType>)
@@ -1380,7 +1441,7 @@ extension MacroApplication {
     }
 
     do {
-      guard !expandingFreestandingMacros.contains(where: { $0 == macro }) else {
+      guard !expandingMacros.contains(where: { $0 == macro }) else {
         // We may think of any ongoing macro expansion as a tree in which macro types being expanded are nodes.
         // Any macro type being expanded more than once will create a cycle which the compiler as of now doesn't allow.
         throw MacroExpansionError.recursiveExpansion(macro)
